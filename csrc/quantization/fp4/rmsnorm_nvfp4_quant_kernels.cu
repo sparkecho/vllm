@@ -23,14 +23,72 @@
 namespace vllm {
 
 // Use UE4M3 by default.
+template <typename scalar_t>
+__global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
+    rms_norm_row_ss_2d(const int num_tokens, const int hidden_size,
+                       scalar_t const* __restrict__ input,
+                       float* __restrict__ row_ss) {
+  using PackedVecT = vllm::PackedVec<scalar_t>;
+
+  // SF count along K, padded to a multiple of 4 (swizzle tile requirement).
+  const int sf_k_unpadded = hidden_size / CVT_FP4_SF_VEC_SIZE;
+  static constexpr int SF_KTILE_SIZE = 4;
+  const int sf_k_padded =
+      ((sf_k_unpadded + SF_KTILE_SIZE - 1) / SF_KTILE_SIZE) * SF_KTILE_SIZE;
+
+  // SF layout requires rows padded to 128 and SF cols padded to 4.
+  const int sf_rows = (num_tokens + 127) / 128 * 128;
+  const int vecs_per_row_padded =
+      sf_k_padded * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+
+  for (int row_idx = blockIdx.x; row_idx < sf_rows; row_idx += gridDim.x) {
+    const scalar_t* row_input = input + row_idx * hidden_size;
+
+    float variance = 0.0f;
+    for (int col_idx = blockIdx.y * blockDim.x + threadIdx.x;
+         col_idx < vecs_per_row_padded;
+         col_idx += blockDim.x * gridDim.y) {
+      const int elem_idx = col_idx * CVT_FP4_ELTS_PER_THREAD;
+      PackedVecT vec{};
+
+      bool valid = (row_idx < num_tokens) && (elem_idx < hidden_size);
+      if constexpr (CVT_FP4_PACK16) {
+        ld256_or_zero_cg_u32<scalar_t>(
+            vec, &reinterpret_cast<const uint32_t*>(row_input)[col_idx * 8],
+            valid);
+      } else {
+        ld128_or_zero_cg_u32<scalar_t>(
+            vec, &reinterpret_cast<const uint32_t*>(row_input)[col_idx * 4],
+            valid);
+      }
+
+      if (valid) {
+        variance += compute_packed_sum_squares(vec);
+      }
+    }
+
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage reduce_storage;
+    variance =
+        BlockReduce(reduce_storage).Reduce(variance, CubAddOp{}, blockDim.x);
+
+    if (threadIdx.x == 0) {
+      atomicAdd(&row_ss[row_idx], variance);
+    }
+  }
+}
+
+// Use UE4M3 by default.
 template <typename scalar_t, bool UE8M0_SF = false>
 __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
-    rms_norm_cvt_fp16_to_fp4(const int num_tokens, const int hidden_size,
-                             scalar_t const* __restrict__ input,
-                             scalar_t const* __restrict__ weight,
-                             float const* __restrict__ scale,
-                             const float epsilon, uint32_t* __restrict__ output,
-                             uint32_t* __restrict__ output_scale) {
+    rms_norm_cvt_fp16_to_fp4_2d(const int num_tokens, const int hidden_size,
+                                scalar_t const* __restrict__ input,
+                                scalar_t const* __restrict__ weight,
+                                float const* __restrict__ scale,
+                                const float epsilon,
+                                float const* __restrict__ row_ss,
+                                uint32_t* __restrict__ output,
+                                uint32_t* __restrict__ output_scale) {
   using PackedVecT = vllm::PackedVec<scalar_t>;
 
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
@@ -53,49 +111,22 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
       sf_k_padded * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
   for (int row_idx = blockIdx.x; row_idx < sf_rows; row_idx += gridDim.x) {
-    const bool valid_row = row_idx < num_tokens;
-    const scalar_t* row_input = input + row_idx * hidden_size;
-
-    float variance = 0.0f;
-    for (int col_idx = threadIdx.x; col_idx < vecs_per_row_padded;
-         col_idx += blockDim.x) {
-      const int elem_idx = col_idx * CVT_FP4_ELTS_PER_THREAD;
-      PackedVecT vec{};
-
-      bool valid = valid_row && (elem_idx < hidden_size);
-      if constexpr (CVT_FP4_PACK16) {
-        ld256_or_zero_cg_u32<scalar_t>(
-            vec, &reinterpret_cast<const uint32_t*>(row_input)[col_idx * 8],
-            valid);
-      } else {
-        ld128_or_zero_cg_u32<scalar_t>(
-            vec, &reinterpret_cast<const uint32_t*>(row_input)[col_idx * 4],
-            valid);
-      }
-
-      if (valid) {
-        variance += compute_packed_sum_squares(vec);
-      }
-    }
-
-    using BlockReduce = cub::BlockReduce<float, 1024>;
-    __shared__ typename BlockReduce::TempStorage reduce_storage;
-    variance =
-        BlockReduce(reduce_storage).Reduce(variance, CubAddOp{}, blockDim.x);
-
     if (threadIdx.x == 0) {
-      s_rms_inv = rsqrtf(variance / static_cast<float>(hidden_size) + epsilon);
+      s_rms_inv = rsqrtf(
+          row_ss[row_idx] / static_cast<float>(hidden_size) + epsilon);
     }
     __syncthreads();
 
     const float rms_inv = s_rms_inv;
+    const scalar_t* row_input = input + row_idx * hidden_size;
     uint32_t* row_out = output + row_idx * vecs_per_row;
 
-    for (int col_idx = threadIdx.x; col_idx < vecs_per_row_padded;
-         col_idx += blockDim.x) {
+    for (int col_idx = blockIdx.y * blockDim.x + threadIdx.x;
+         col_idx < vecs_per_row_padded;
+         col_idx += blockDim.x * gridDim.y) {
       const int elem_idx = col_idx * CVT_FP4_ELTS_PER_THREAD;
       const bool valid_col = elem_idx < hidden_size;
-      const bool valid = valid_row && valid_col;
+      const bool valid = (row_idx < num_tokens) && valid_col;
 
       PackedVecT in_vec{}, w_vec{};
 
@@ -145,29 +176,19 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
 // Fused Add + RMSNorm + FP4 quantization kernel
 // Performs: residual = input + residual, then RMSNorm(residual) -> FP4 quant
 // Addition is done in high precision (BF16/FP16) before normalization.
-template <typename scalar_t, bool UE8M0_SF = false>
+template <typename scalar_t>
 __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
-    fused_add_rms_norm_cvt_fp16_to_fp4(
-        const int num_tokens, const int hidden_size,
-        scalar_t const* __restrict__ input, scalar_t* __restrict__ residual,
-        scalar_t const* __restrict__ weight, float const* __restrict__ scale,
-        const float epsilon, uint32_t* __restrict__ output,
-        uint32_t* __restrict__ output_scale) {
+    fused_add_rms_norm_row_ss_2d(const int num_tokens, const int hidden_size,
+                                 scalar_t const* __restrict__ input,
+                                 scalar_t* __restrict__ residual,
+                                 float* __restrict__ row_ss) {
   using PackedVecT = vllm::PackedVec<scalar_t>;
-
-  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
-      CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
-
-  __shared__ float s_rms_inv;
 
   // SF count along K, padded to a multiple of 4 (swizzle tile requirement).
   const int sf_k_unpadded = hidden_size / CVT_FP4_SF_VEC_SIZE;
   static constexpr int SF_KTILE_SIZE = 4;
   const int sf_k_padded =
       ((sf_k_unpadded + SF_KTILE_SIZE - 1) / SF_KTILE_SIZE) * SF_KTILE_SIZE;
-  const int32_t num_k_tiles = sf_k_padded / SF_KTILE_SIZE;
-  const float global_scale = (scale == nullptr) ? 1.0f : scale[0];
-  const int vecs_per_row = hidden_size / CVT_FP4_ELTS_PER_THREAD;
 
   // SF layout requires rows padded to 128 and SF cols padded to 4.
   const int sf_rows = (num_tokens + 127) / 128 * 128;
@@ -175,19 +196,19 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
       sf_k_padded * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
   for (int row_idx = blockIdx.x; row_idx < sf_rows; row_idx += gridDim.x) {
-    const bool valid_row = row_idx < num_tokens;
     const scalar_t* row_input = input + row_idx * hidden_size;
     scalar_t* row_residual = residual + row_idx * hidden_size;
 
     // First pass: compute x = input + residual, update residual, compute
     // variance
     float variance = 0.0f;
-    for (int col_idx = threadIdx.x; col_idx < vecs_per_row_padded;
-         col_idx += blockDim.x) {
+    for (int col_idx = blockIdx.y * blockDim.x + threadIdx.x;
+         col_idx < vecs_per_row_padded;
+         col_idx += blockDim.x * gridDim.y) {
       const int elem_idx = col_idx * CVT_FP4_ELTS_PER_THREAD;
       PackedVecT in_vec{}, res_vec{}, added_vec{};
 
-      bool valid = valid_row && (elem_idx < hidden_size);
+      bool valid = (row_idx < num_tokens) && (elem_idx < hidden_size);
       if constexpr (CVT_FP4_PACK16) {
         ld256_or_zero_cg_u32<scalar_t>(
             in_vec, &reinterpret_cast<const uint32_t*>(row_input)[col_idx * 8],
@@ -235,65 +256,8 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
         BlockReduce(reduce_storage).Reduce(variance, CubAddOp{}, blockDim.x);
 
     if (threadIdx.x == 0) {
-      s_rms_inv = rsqrtf(variance / static_cast<float>(hidden_size) + epsilon);
+      atomicAdd(&row_ss[row_idx], variance);
     }
-    __syncthreads();
-
-    const float rms_inv = s_rms_inv;
-    uint32_t* row_out = output + row_idx * vecs_per_row;
-
-    // Second pass: read updated residual, apply RMSNorm and quantize
-    for (int col_idx = threadIdx.x; col_idx < vecs_per_row_padded;
-         col_idx += blockDim.x) {
-      const int elem_idx = col_idx * CVT_FP4_ELTS_PER_THREAD;
-      const bool valid_col = elem_idx < hidden_size;
-      const bool valid = valid_row && valid_col;
-
-      PackedVecT in_vec{}, w_vec{};
-
-      if constexpr (CVT_FP4_PACK16) {
-        // Read from updated residual
-        ld256_or_zero_cg_u32<scalar_t>(
-            in_vec,
-            &reinterpret_cast<const uint32_t*>(row_residual)[col_idx * 8],
-            valid);
-        ld256_or_zero_cg_u32<scalar_t>(
-            w_vec, &reinterpret_cast<const uint32_t*>(weight)[col_idx * 8],
-            valid);
-      } else {
-        ld128_or_zero_cg_u32<scalar_t>(
-            in_vec,
-            &reinterpret_cast<const uint32_t*>(row_residual)[col_idx * 4],
-            valid);
-        ld128_or_zero_cg_u32<scalar_t>(
-            w_vec, &reinterpret_cast<const uint32_t*>(weight)[col_idx * 4],
-            valid);
-      }
-
-      PackedVecT norm_vec = compute_rms_norm(in_vec, w_vec, rms_inv);
-
-      uint8_t* sf_out =
-          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                             CVT_FP4_NUM_THREADS_PER_SF>(
-              row_idx, col_idx, num_k_tiles, output_scale);
-
-      auto fp4_packed =
-          cvt_warp_fp16_to_fp4<scalar_t, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
-              norm_vec, global_scale, sf_out);
-
-      if (valid) {
-        if constexpr (CVT_FP4_PACK16) {
-          int64_t out_offset = row_idx * (hidden_size / 8) + col_idx * 2;
-          uint64_t packed64 =
-              (uint64_t(fp4_packed.hi) << 32) | uint64_t(fp4_packed.lo);
-          reinterpret_cast<uint64_t*>(output)[out_offset >> 1] = packed64;
-        } else {
-          row_out[col_idx] = fp4_packed;
-        }
-      }
-    }
-
-    __syncthreads();
   }
 }
 
@@ -327,19 +291,39 @@ void rms_norm_nvfp4_quant_sm1xxa(
       vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
   // SF layout pads rows to 128, so we need to process those padded rows too
   int effective_rows = (num_tokens + 127) / 128 * 128;
-  dim3 grid(
-      std::min(effective_rows, multi_processor_count * num_blocks_per_sm));
+
+  const int sf_k_unpadded = hidden_size / CVT_FP4_SF_VEC_SIZE;
+  static constexpr int SF_KTILE_SIZE = 4;
+  const int sf_k_padded =
+      ((sf_k_unpadded + SF_KTILE_SIZE - 1) / SF_KTILE_SIZE) * SF_KTILE_SIZE;
+  const int vecs_per_row_padded =
+      sf_k_padded * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+
+  int grid_y = vllm::div_round_up(vecs_per_row_padded, static_cast<int>(block.x));
+  int grid_x = std::min(
+      effective_rows,
+      std::max(1, (multi_processor_count * num_blocks_per_sm) / grid_y));
+  dim3 grid(grid_x, grid_y);
+
+  auto row_ss = torch::zeros({effective_rows},
+                             input.options().dtype(at::kFloat));
 
   VLLM_DISPATCH_HALF_TYPES(
       input.scalar_type(), "rms_norm_nvfp4_quant_kernel", [&] {
         using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
-        vllm::rms_norm_cvt_fp16_to_fp4<cuda_type><<<grid, block, 0, stream>>>(
+        vllm::rms_norm_row_ss_2d<cuda_type><<<grid, block, 0, stream>>>(
             num_tokens, hidden_size,
             reinterpret_cast<cuda_type const*>(input.data_ptr()),
-            reinterpret_cast<cuda_type const*>(weight.data_ptr()),
-            scale.data_ptr<float>(), static_cast<float>(epsilon),
-            reinterpret_cast<uint32_t*>(output.data_ptr()),
-            reinterpret_cast<uint32_t*>(output_scale.data_ptr()));
+            row_ss.data_ptr<float>());
+        vllm::rms_norm_cvt_fp16_to_fp4_2d<cuda_type>
+            <<<grid, block, 0, stream>>>(
+                num_tokens, hidden_size,
+                reinterpret_cast<cuda_type const*>(input.data_ptr()),
+                reinterpret_cast<cuda_type const*>(weight.data_ptr()),
+                scale.data_ptr<float>(), static_cast<float>(epsilon),
+                row_ss.data_ptr<float>(),
+                reinterpret_cast<uint32_t*>(output.data_ptr()),
+                reinterpret_cast<uint32_t*>(output_scale.data_ptr()));
       });
 }
 
@@ -375,19 +359,38 @@ void fused_add_rms_norm_nvfp4_quant_sm1xxa(
       vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
   // SF layout pads rows to 128, so we need to process those padded rows too
   int effective_rows = (num_tokens + 127) / 128 * 128;
-  dim3 grid(
-      std::min(effective_rows, multi_processor_count * num_blocks_per_sm));
+
+  const int sf_k_unpadded = hidden_size / CVT_FP4_SF_VEC_SIZE;
+  static constexpr int SF_KTILE_SIZE = 4;
+  const int sf_k_padded =
+      ((sf_k_unpadded + SF_KTILE_SIZE - 1) / SF_KTILE_SIZE) * SF_KTILE_SIZE;
+  const int vecs_per_row_padded =
+      sf_k_padded * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+
+  int grid_y = vllm::div_round_up(vecs_per_row_padded, static_cast<int>(block.x));
+  int grid_x = std::min(
+      effective_rows,
+      std::max(1, (multi_processor_count * num_blocks_per_sm) / grid_y));
+  dim3 grid(grid_x, grid_y);
+
+  auto row_ss = torch::zeros({effective_rows},
+                             input.options().dtype(at::kFloat));
 
   VLLM_DISPATCH_HALF_TYPES(
       input.scalar_type(), "fused_add_rms_norm_nvfp4_quant_kernel", [&] {
         using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
-        vllm::fused_add_rms_norm_cvt_fp16_to_fp4<cuda_type>
+        vllm::fused_add_rms_norm_row_ss_2d<cuda_type><<<grid, block, 0, stream>>>(
+            num_tokens, hidden_size,
+            reinterpret_cast<cuda_type const*>(input.data_ptr()),
+            reinterpret_cast<cuda_type*>(residual.data_ptr()),
+            row_ss.data_ptr<float>());
+        vllm::rms_norm_cvt_fp16_to_fp4_2d<cuda_type>
             <<<grid, block, 0, stream>>>(
                 num_tokens, hidden_size,
-                reinterpret_cast<cuda_type const*>(input.data_ptr()),
-                reinterpret_cast<cuda_type*>(residual.data_ptr()),
+                reinterpret_cast<cuda_type const*>(residual.data_ptr()),
                 reinterpret_cast<cuda_type const*>(weight.data_ptr()),
                 scale.data_ptr<float>(), static_cast<float>(epsilon),
+                row_ss.data_ptr<float>(),
                 reinterpret_cast<uint32_t*>(output.data_ptr()),
                 reinterpret_cast<uint32_t*>(output_scale.data_ptr()));
       });
