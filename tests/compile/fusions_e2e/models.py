@@ -83,6 +83,7 @@ llama3_8b_fp8 = ModelFusionInfo(
 llama3_8b_fp4 = ModelFusionInfo(
     model_name="nvidia/Llama-3.1-8B-Instruct-FP4",
     matches=lambda n_layers: Matches(
+        rms_quant_fusion=n_layers * 2,
         act_quant_fusion=n_layers,
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
@@ -112,6 +113,7 @@ llama4_scout_fp4 = ModelFusionInfo(
     model_name="nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4",
     hf_overrides=lambda n_layers: {"text_config": {"num_hidden_layers": n_layers}},
     matches=lambda n_layers: Matches(
+        rms_quant_fusion=n_layers,
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2,
         sequence_parallel=n_layers * 2,
@@ -160,6 +162,21 @@ deepseek_v3_fp8 = ModelFusionInfo(
         # TODO
         # sequence_parallel= n_layers * 2 + 1,
         # async_tp=n_layers * 2,
+    ),
+)
+
+# DeepSeek-R1 FP4 shares DeepSeek-V3 MLA+MoE architecture.
+deepseek_r1_fp4 = ModelFusionInfo(
+    model_name="nvidia/DeepSeek-R1-0528-FP4-v2",
+    hf_overrides=lambda n_layers: {
+        "num_layers": n_layers,
+        "num_hidden_layers": n_layers,
+    },
+    matches=lambda n_layers: Matches(
+        rms_quant_fusion=n_layers * 2 + min(3, n_layers),
+        act_quant_fusion=0,
+        attn_quant_fusion=0,
+        ar_rms_fusion=n_layers * 2 + 1,
     ),
 )
 
